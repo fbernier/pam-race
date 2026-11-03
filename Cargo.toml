@@ -1,0 +1,33 @@
+[package]
+name = "pam-race"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PAM module that runs several PAM stacks concurrently; the first one to succeed wins"
+publish = false
+
+[lib]
+name = "pam_race"
+# cdylib: the PAM module itself. rlib: lets the helper binary share the
+# wire protocol and FFI declarations.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "pam-race-helper"
+path = "src/bin/helper.rs"
+
+# Minimal sudo-like PAM application for the integration tests. A bin, not an
+# example, so `cargo test` always builds it and exposes CARGO_BIN_EXE_*.
+# `make install` does not install it.
+[[bin]]
+name = "pam-race-testhost"
+path = "testing/host.rs"
+test = false
+doc = false
+
+[dependencies]
+libc = "0.2.186"
+
+[profile.release]
+lto = true
+codegen-units = 1
