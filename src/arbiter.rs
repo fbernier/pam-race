@@ -29,6 +29,11 @@
 //! * A prompt the host is blocked in becomes obsolete once the race is
 //!   decided or the helper that asked is gone. Its answer is then discarded,
 //!   never committed to, and the prompt is released (see [`Release`]).
+//! * While the host is blocked in a prompt the race still needs, its
+//!   conversation can't show anything else. What another helper says, or
+//!   that it dropped out (a fingerprint reader timing out), becomes an
+//!   [`Aside`] for the shell to show beside the prompt; it is still queued
+//!   for the conversation as usual.
 //!
 //! Releasing a prompt means pushing a newline into the terminal, which
 //! whatever process reads it takes as Enter. So a newline is only pushed
@@ -42,7 +47,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::time::{Duration, Instant};
 
-use crate::types::{HelperId, Messages, PamError, PamResult, Responses, TtyState};
+use crate::types::{HelperId, Messages, PamError, PamResult, Responses, Text, TtyState};
 
 /// Conversation calls one helper may have waiting for the host.
 pub const MAX_QUEUED: usize = 16;
@@ -144,6 +149,18 @@ pub enum Release {
     },
 }
 
+/// News from another helper while the host is blocked in a prompt. The
+/// host's conversation can't carry it then, so the shell shows it beside the
+/// prompt (see [`Arbiter::take_aside`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Aside {
+    /// Its latest informational message.
+    Said(HelperId, Text),
+    /// It is out of the race, with the message it last said during this
+    /// prompt, if any (e.g. "Verification timed out").
+    Stopped(HelperId, Option<Text>),
+}
+
 /// Progress of the release of the current prompt.
 #[derive(Clone, Copy, Default)]
 enum Releasing {
@@ -175,6 +192,10 @@ pub struct Arbiter {
     releasing: Releasing,
     /// A newline of ours may be in the terminal's input queue.
     pushed: bool,
+    /// The latest news for the user during the current prompt, and whether
+    /// it has not been handed to the shell yet.
+    aside: Option<Aside>,
+    aside_due: bool,
     outcome: Option<Outcome>,
 }
 
@@ -189,6 +210,8 @@ impl Arbiter {
             committed: None,
             releasing: Releasing::NotStarted,
             pushed: false,
+            aside: None,
+            aside_due: false,
             outcome: None,
         }
     }
@@ -205,6 +228,10 @@ impl Arbiter {
         };
         let room =
             msgs.is_prompt() || self.queue.iter().filter(|(f, _)| *f == from).count() < MAX_QUEUED;
+        if delivers && !msgs.is_prompt() && self.prompt_needed_from_other(from) {
+            let last = msgs.as_slice()[msgs.len() - 1].text.clone();
+            self.set_aside(Aside::Said(from, last));
+        }
         if delivers && room {
             self.queue.push_back((from, msgs));
         }
@@ -240,8 +267,34 @@ impl Arbiter {
         if let Some(o) = decided {
             self.outcome = Some(o);
             self.queue.retain(|(from, m)| o.delivers(*from, m));
+        } else if self.committed.is_none() && self.prompt_needed_from_other(who) {
+            let last = match &self.aside {
+                Some(Aside::Said(h, text)) if *h == who => Some(text.clone()),
+                _ => None,
+            };
+            self.set_aside(Aside::Stopped(who, last));
         }
         decided
+    }
+
+    /// The host is blocked in a prompt the race still needs, asked by a
+    /// helper other than `who`.
+    fn prompt_needed_from_other(&self, who: HelperId) -> bool {
+        self.outcome.is_none() && self.prompting.is_some_and(|p| p != who)
+    }
+
+    fn set_aside(&mut self, aside: Aside) {
+        self.aside = Some(aside);
+        self.aside_due = true;
+    }
+
+    /// News to show beside the host's prompt, if any came up since the last
+    /// call and the prompt is still needed (an obsolete one is released).
+    pub fn take_aside(&mut self) -> Option<Aside> {
+        if !mem::take(&mut self.aside_due) || self.obsolete().is_some() {
+            return None;
+        }
+        self.aside.clone()
     }
 
     fn all_failed(&self) -> Option<PamError> {
@@ -301,6 +354,8 @@ impl Arbiter {
         debug_assert_eq!(self.prompting, Some(from));
         self.prompting = None;
         self.releasing = Releasing::NotStarted;
+        self.aside = None;
+        self.aside_due = false;
         let flush_input = mem::take(&mut self.pushed);
         let gone = self.helpers[from.0].finished.is_some();
         let action = match (self.outcome, answer) {
@@ -843,5 +898,87 @@ mod tests {
         t.arb.helper_finished(A, Ok(()));
         assert_eq!(t.arb.abandon(PamError::SYSTEM_ERR), None, "already won");
         assert!(matches!(t.step(), HostStep::Finish(Ok(()))));
+    }
+
+    fn text(s: &str) -> Text {
+        Text::parse(s.as_bytes()).unwrap()
+    }
+
+    /// B's password prompt is up; A is a fingerprint reader still racing.
+    fn at_bs_prompt() -> (T, HelperId, Messages) {
+        let mut t = T::new(2);
+        t.arb.helper_said(B, prompt());
+        let HostStep::Ask(h, m) = t.step_late() else {
+            panic!("expected B's prompt")
+        };
+        (t, h, m)
+    }
+
+    #[test]
+    fn news_from_another_helper_during_a_prompt_is_an_aside_once() {
+        let (mut t, ..) = at_bs_prompt();
+        assert_eq!(t.arb.take_aside(), None);
+        t.arb.helper_said(A, info("place finger"));
+        assert_eq!(
+            t.arb.take_aside(),
+            Some(Aside::Said(A, text("place finger")))
+        );
+        assert_eq!(t.arb.take_aside(), None, "handed over once");
+        t.arb.helper_said(A, info("no match"));
+        assert_eq!(t.arb.take_aside(), Some(Aside::Said(A, text("no match"))));
+    }
+
+    #[test]
+    fn a_helper_dropping_out_during_a_prompt_is_an_aside_with_its_last_words() {
+        let (mut t, ..) = at_bs_prompt();
+        t.arb.helper_said(A, info("Verification timed out"));
+        assert_eq!(
+            t.arb.helper_finished(A, Err(PamError::AUTH_ERR)),
+            None,
+            "B can still win"
+        );
+        assert_eq!(
+            t.arb.take_aside(),
+            Some(Aside::Stopped(A, Some(text("Verification timed out"))))
+        );
+
+        let (mut t, ..) = at_bs_prompt();
+        t.arb.helper_finished(A, Err(PamError::AUTH_ERR));
+        assert_eq!(t.arb.take_aside(), Some(Aside::Stopped(A, None)));
+    }
+
+    #[test]
+    fn no_aside_without_a_prompt_still_needed() {
+        let mut t = T::new(2);
+        t.arb.helper_said(A, info("place finger"));
+        assert_eq!(
+            t.arb.take_aside(),
+            None,
+            "no prompt: the conversation shows it"
+        );
+
+        let (mut t, h, m) = at_bs_prompt();
+        t.arb.helper_said(A, info("place finger"));
+        t.arb.prompt_returned(h, answer(&m));
+        assert_eq!(t.arb.take_aside(), None, "the prompt is gone");
+
+        let (mut t, ..) = at_bs_prompt();
+        t.arb.helper_said(A, info("place finger"));
+        t.arb.helper_finished(A, Ok(()));
+        assert_eq!(t.arb.take_aside(), None, "decided: the prompt is released");
+    }
+
+    #[test]
+    fn after_committing_others_dropping_out_is_no_aside() {
+        let (mut t, h, m) = at_bs_prompt();
+        t.arb.prompt_returned(h, answer(&m));
+        // B asks again (say, for an OTP); A's news is not the user's concern.
+        t.arb.helper_said(B, prompt());
+        let HostStep::Ask(..) = t.step_late() else {
+            panic!("expected B's second prompt")
+        };
+        t.arb.helper_said(A, info("place finger"));
+        t.arb.helper_finished(A, Err(PamError::AUTH_ERR));
+        assert_eq!(t.arb.take_aside(), None);
     }
 }

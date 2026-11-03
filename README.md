@@ -87,6 +87,7 @@ The code is a **functional core inside an imperative shell**. Every boundary is 
 5. Prompts are held for up to `settle` ms until every helper has said something, so "Place your finger on the fingerprint reader" appears *before* the password prompt blocks the conversation. Informational messages always go ahead of queued prompts.
 6. Once the user has answered a prompt, only that helper's messages are shown. Once the race is decided, only the deciding helper's messages are shown (everyone's if everyone failed).
 7. A prompt is released once it is obsolete: the race is decided, or the helper that asked is gone. Its answer is discarded, and the user is not committed to a helper that is gone, so the others stay in the race.
+8. While the host is blocked in a prompt, its conversation can't show anything else. What another helper says meanwhile, or that it stopped (a fingerprint reader timing out), is written at the right end of the prompt's line, and the cursor put back: `sudo-fprint stopped: Verification timed out`. Only while the host owns the terminal, and only on a terminal with cursor control (`TERM` set, not `dumb`).
 
 ## Configuration
 
@@ -130,6 +131,8 @@ session   optional  pam_systemd.so class=none
 * **pam_race failing to run** (module missing, helpers unable to start) is ignored, and the plain `system-auth` password stack takes over. A broken install cannot lock you out of sudo.
 
 Sub-stacks only run their **authenticate** phase, so modules that act in `setcred`, such as `pam_env`, belong in the outer stack before `pam_race` (hence the `pam_env` line).
+
+`pam_fprintd` gives up after `timeout=` seconds (default 30) or `max-tries=` failed matches (default 3); the fingerprint is then out of this attempt, and the password prompt says so beside it. A longer `timeout=` (or `-1`, none) in `sudo-fprint` keeps the reader waiting as long as sudo does, but holds it meanwhile: fprintd lets one client at a time use a reader, so a lock screen can't take a fingerprint until sudo is done.
 
 On CachyOS the `pam_fprintd` line in `/etc/pam.d/sudo` is managed by `chwd` (`# chwd-fprintd`). Re-applying the fprint profile may add it back, which would put the sequential fingerprint step in front again.
 

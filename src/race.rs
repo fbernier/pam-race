@@ -18,7 +18,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 use std::{io, mem, ptr, thread};
 
-use crate::arbiter::{AfterPrompt, Arbiter, HostStep, Obsolete, Outcome, Release};
+use crate::arbiter::{AfterPrompt, Arbiter, Aside, HostStep, Obsolete, Outcome, Release};
 use crate::config::Config;
 use crate::ffi::*;
 use crate::proto::{self, FromHelper, ProtoError};
@@ -451,6 +451,7 @@ impl Watcher<'_> {
                 self.handle(h, event);
             }
             release_at = self.release(Instant::now());
+            self.show_aside();
         }
     }
 
@@ -516,6 +517,29 @@ impl Watcher<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// Show the news the host's prompt keeps its conversation from carrying,
+    /// beside the prompt: only while the host owns the terminal, and not once
+    /// a line is queued (the host is about to move past the prompt).
+    fn show_aside(&self) {
+        let Some(tty) = self.tty else { return };
+        let mut arb = self.shared.lock();
+        if tty.state() != TtyState::Idle {
+            return;
+        }
+        if let Some(aside) = arb.take_aside() {
+            tty.aside(&self.aside_text(&aside));
+        }
+    }
+
+    fn aside_text(&self, aside: &Aside) -> String {
+        let said = |t: &Text| t.as_cstr().to_string_lossy().into_owned();
+        match aside {
+            Aside::Said(h, t) => format!("{}: {}", self.name(*h), said(t)),
+            Aside::Stopped(h, Some(t)) => format!("{} stopped: {}", self.name(*h), said(t)),
+            Aside::Stopped(h, None) => format!("{} stopped", self.name(*h)),
         }
     }
 

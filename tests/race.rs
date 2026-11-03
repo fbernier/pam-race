@@ -101,6 +101,12 @@ impl Race {
         .unwrap();
 
         let (mut m, mut s) = (0, 0);
+        let size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         assert_eq!(
             unsafe {
                 libc::openpty(
@@ -108,7 +114,7 @@ impl Race {
                     &mut s,
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    std::ptr::null(),
+                    &size,
                 )
             },
             0
@@ -117,7 +123,7 @@ impl Race {
         // The stand-in stacks never look the user up: no passwd entry needed.
         let mut cmd = Command::new(HOST);
         cmd.arg(&dir).arg("race").arg("pam-race-test");
-        cmd.envs(env.iter().copied());
+        cmd.env("TERM", "xterm-256color").envs(env.iter().copied());
         cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -308,22 +314,44 @@ fn all_methods_failing_reports_failure_and_every_message() {
 }
 
 #[test]
-fn messages_queued_behind_a_prompt_are_dropped_after_a_win() {
-    // "chatty" speaks again while the password prompt blocks the host; by the
-    // time the prompt is released, "finger" has won and that line is stale.
+fn messages_behind_a_prompt_are_shown_beside_it_and_dropped_after_a_win() {
+    // "chatty" speaks again while the password prompt blocks the host's
+    // conversation: that shows beside the prompt. By the time the prompt is
+    // released, "finger" has won and the conversation drops that line.
     let chatty = (
         "chatty".to_string(),
         "#!/bin/sh\necho 'chatty: hello'\n/usr/bin/sleep 0.5\necho 'chatty: stale'\nexec /usr/bin/sleep 30\n".to_string(),
     );
     let mut r = Race::start("stale", &[chatty, finger("finger", 2, 0), password()]);
     r.expect("Password: ", QUICK);
+    r.expect("chatty: chatty: stale", QUICK);
     if !can_push_input() {
         r.expect("Press Enter to continue.", QUICK);
         r.type_("\n");
     }
     assert_eq!(r.result(QUICK), PAM_SUCCESS, "{}", r.out);
     assert!(r.out.contains("chatty: hello"), "{}", r.out);
-    assert!(!r.out.contains("chatty: stale"), "{}", r.out);
+    assert_eq!(
+        r.out.matches("chatty: stale").count(),
+        1,
+        "only beside the prompt:\n{}",
+        r.out
+    );
+}
+
+#[test]
+fn a_fingerprint_timing_out_at_the_password_prompt_says_so_beside_it() {
+    // pam_fprintd's way: a last message, then failure.
+    let reader = (
+        "finger".to_string(),
+        "#!/bin/sh\necho 'Place your finger'\n/usr/bin/sleep 1\necho 'Verification timed out'\nexit 1\n"
+            .to_string(),
+    );
+    let mut r = Race::start("finger-timeout", &[reader, password()]);
+    r.expect("Password: ", QUICK);
+    r.expect("finger stopped: Verification timed out", QUICK);
+    r.type_("hunter2\n");
+    assert_eq!(r.result(QUICK), PAM_SUCCESS, "{}", r.out);
 }
 
 // ------------------------------------------------------- injected failures
